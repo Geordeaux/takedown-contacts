@@ -24,14 +24,14 @@ def get_rdap_info(domain, retries=3):
     return None
 
 def get_whois_info(domain):
-    """Fetch WHOIS data for a given domain."""
+    """Fetch WHOIS data for a given domain and extract relevant information."""
     try:
         w = whois.whois(domain)
-        if hasattr(w, 'emails'):
-            return list(set(email for email in w.emails if email and isinstance(email, str))) if isinstance(w.emails, list) else [w.emails]
+        emails = list(set(email for email in w.emails if email and isinstance(email, str))) if isinstance(w.emails, list) else ([w.emails] if isinstance(w.emails, str) else [])
+        nameservers = w.name_servers if hasattr(w, 'name_servers') else None
+        return emails, nameservers
     except Exception:
-        return None
-    return None
+        return None, None
 
 def extract_abuse_email(rdap_data):
     """Extract abuse contact emails from RDAP data."""
@@ -43,7 +43,18 @@ def extract_abuse_email(rdap_data):
                     for item in entity['vcardArray'][1]:
                         if item[0] == 'email' and isinstance(item[3], str):
                             emails.add(item[3])
-    return list(emails) if emails else None
+    return list(emails) if emails else []
+
+def extract_nameservers(rdap_data, whois_ns):
+    """Extract nameservers from RDAP data, falling back to WHOIS if necessary."""
+    nameservers = []
+    if rdap_data and 'nameservers' in rdap_data:
+        for ns in rdap_data['nameservers']:
+            if 'ldhName' in ns:
+                nameservers.append(ns['ldhName'])
+    if not nameservers and whois_ns:
+        nameservers = whois_ns
+    return nameservers if nameservers else []
 
 def get_asn_info(ip):
     """Retrieve ASN and ISP information for a given IP address."""
@@ -55,19 +66,6 @@ def get_asn_info(ip):
     except Exception:
         return None, None
     return None, None
-
-def get_abuse_emails_for_domains(domains):
-    """Retrieve abuse contact emails for a list of domains via RDAP and WHOIS, ensuring deduplication."""
-    abuse_contacts = set()
-    for domain in domains:
-        rdap_data = get_rdap_info(domain)
-        if rdap_data:
-            abuse_contacts.update(extract_abuse_email(rdap_data) or [])
-        
-        whois_emails = get_whois_info(domain)
-        if whois_emails:
-            abuse_contacts.update(whois_emails)
-    return list(abuse_contacts) if abuse_contacts else None
 
 def main(csv_file):
     """Process the ICANN CSV and fetch abuse contact emails while adding ASN and ISP information."""
@@ -81,38 +79,34 @@ def main(csv_file):
     df['ASN Number'] = None
     df['ISP Provider'] = None
     
-    seen_emails = {
-        'Registrar': set(),
-        'NS': set(),
-        'MX': set(),
-        'IP': set(),
-        'ASN': set(),
-        'CDN': set()
-    }
-    
     for index, row in tqdm(df.iterrows(), total=df.shape[0]):
         domain = clean_domain(row['Link'])
         
-        # Fetch RDAP & WHOIS Data
-        registrar_abuse_contacts = get_abuse_emails_for_domains([domain])
-        if registrar_abuse_contacts:
-            unique_contacts = [email for email in registrar_abuse_contacts if email and email not in seen_emails['Registrar']]
-            seen_emails['Registrar'].update(unique_contacts)
-            df.at[index, 'Registrar Abuse Email'] = ', '.join(unique_contacts) if unique_contacts else None
+        # Perform a single RDAP and WHOIS lookup per domain
+        rdap_data = get_rdap_info(domain)
+        whois_emails, whois_nameservers = get_whois_info(domain)
+        
+        # Extract Abuse Emails
+        registrar_abuse_contacts = extract_abuse_email(rdap_data) + whois_emails
+        df.at[index, 'Registrar Abuse Email'] = ', '.join(filter(None, registrar_abuse_contacts)) if registrar_abuse_contacts else None
+        
+        # Extract Nameservers (RDAP preferred, fallback to WHOIS)
+        nameservers = extract_nameservers(rdap_data, whois_nameservers)
         
         # Extract NS Abuse Contacts
-        ns_abuse_contacts = get_abuse_emails_for_domains([domain])
-        if ns_abuse_contacts:
-            unique_contacts = [email for email in ns_abuse_contacts if email and email not in seen_emails['NS']]
-            seen_emails['NS'].update(unique_contacts)
-            df.at[index, 'NS Abuse Contacts'] = ', '.join(unique_contacts) if unique_contacts else None
+        ns_abuse_contacts = extract_abuse_email(rdap_data) + whois_emails
+        df.at[index, 'NS Abuse Contacts'] = ', '.join(filter(None, ns_abuse_contacts)) if ns_abuse_contacts else None
+        
+        # Extract MX Servers
+        try:
+            mx_answers = dns.resolver.resolve(domain, 'MX')
+            mx_records = [str(r.exchange).rstrip('.') for r in mx_answers]
+        except Exception:
+            mx_records = None
         
         # Extract MX Abuse Contacts
-        mx_abuse_contacts = get_abuse_emails_for_domains([domain])
-        if mx_abuse_contacts:
-            unique_contacts = [email for email in mx_abuse_contacts if email and email not in seen_emails['MX']]
-            seen_emails['MX'].update(unique_contacts)
-            df.at[index, 'MX Abuse Contacts'] = ', '.join(unique_contacts) if unique_contacts else None
+        mx_abuse_contacts = extract_abuse_email(rdap_data) + whois_emails
+        df.at[index, 'MX Abuse Contacts'] = ', '.join(filter(None, mx_abuse_contacts)) if mx_abuse_contacts else None
         
         # Extract IP Address
         try:
